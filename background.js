@@ -1,6 +1,6 @@
 // Hayaku Translate - Background Service Worker
 // デュアルモード: Google認証 (Worker経由) / APIキー直接
-// 高速化v2: preflight OPTIONS事前キャッシュ + 短縮プロンプト + speculative翻訳
+// 高速化v3: thinkingBudget:0 + safetySettings OFF + chrome.storage.session
 
 // =====================================================
 // Auth State
@@ -56,36 +56,25 @@ function broadcastAuthState() {
 
 // =====================================================
 // Aggressive Preflight Warmup
-// nani-translate方式: OPTIONSプリフライト事前キャッシュ
-// + 実際のストリーミングエンドポイントでTLS/TCP warm
 // =====================================================
-const WARMUP_INTERVAL_MS = 5 * 60 * 1000; // 5分（より攻撃的）
+const WARMUP_INTERVAL_MS = 5 * 60 * 1000;
 
 async function warmupConnection() {
   const settings = await getSettings();
 
   if (authState.authenticated && settings.workerUrl) {
     const base = settings.workerUrl.replace(/\/+$/, '');
-    // Worker: auth verify + OPTIONSプリフライト事前送信
     await Promise.allSettled([
-      fetch(`${base}/api/auth/verify`, {
-        headers: { 'Authorization': `Bearer ${authState.token}` }
-      }),
-      // ストリーミングエンドポイントへのOPTIONS事前送信
+      fetch(`${base}/api/auth/verify`, { headers: { 'Authorization': `Bearer ${authState.token}` } }),
       fetch(`${base}/api/translate/stream`, { method: 'OPTIONS' }),
       fetch(`${base}/api/translate`, { method: 'OPTIONS' }),
     ]);
   } else {
     const apiKey = await getApiKey();
     if (!apiKey) return;
-    // 直接モード: 実際のストリーミングエンドポイントでwarm
-    // countTokensではなくstreamGenerateContentでTLS+DNS+TCPをwarm
     const model = 'gemini-3.1-flash-lite-preview';
-    const gwUrl = settings.gatewayUrl;
-    const streamUrl = buildApiUrl(model, 'streamGenerateContent', apiKey, gwUrl) + '&alt=sse';
-    const nonStreamUrl = buildApiUrl(model, 'generateContent', apiKey, gwUrl);
+    const streamUrl = buildApiUrl(model, 'streamGenerateContent', apiKey, settings.gatewayUrl) + '&alt=sse';
     try {
-      // 極小リクエストで接続をwarm（空翻訳）
       await fetch(streamUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -224,12 +213,41 @@ function selectModel(text, userModel) {
 function calcMaxTokens(text, mode) {
   if (mode === 'reply') return 4096;
   const len = text.length;
-  if (len <= 100) return 256;   // さらに絞る: 短文は256で十分
+  if (len <= 100) return 256;
   if (len <= 300) return 512;
   if (len <= 1000) return 1024;
   if (len <= 3000) return 2048;
   if (len <= 5000) return 4096;
   return 8192;
+}
+
+// =====================================================
+// Safety settings: 翻訳は安全なタスクなのでフィルタOFF → オーバーヘッド削減
+// =====================================================
+const SAFETY_OFF = [
+  { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+];
+
+// =====================================================
+// generationConfig builder
+// thinkingBudget:0 で推論モデルの思考時間を完全スキップ (最大4倍速)
+// =====================================================
+function buildGenConfig(model, temperature, maxOutputTokens) {
+  const config = { temperature, maxOutputTokens };
+
+  // Gemini 2.5 Flash: thinkingBudget=0 で思考完全OFF (最大4倍速)
+  if (model.includes('2.5-flash') && !model.includes('lite')) {
+    config.thinkingConfig = { thinkingBudget: 0 };
+  }
+  // Gemini 2.5 Pro: 最小128まで絞る
+  else if (model.includes('2.5-pro')) {
+    config.thinkingConfig = { thinkingBudget: 128 };
+  }
+
+  return config;
 }
 
 // =====================================================
@@ -239,11 +257,9 @@ const inflightRequests = new Map();
 
 // =====================================================
 // Speculative pre-translation
-// テキスト選択時点でバックグラウンドに通知 → キャッシュに先行投入
 // =====================================================
 const speculativeResults = new Map();
 const SPECULATIVE_MAX = 10;
-const SPECULATIVE_TTL = 60000; // 1min
 
 // =====================================================
 // Context menu & shortcuts
@@ -284,7 +300,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
-  // Speculative pre-translation: content scriptがテキスト選択時に送信
   if (request.action === 'speculative-translate') {
     speculativeTranslate(request.text, request.targetLang);
     return false;
@@ -311,14 +326,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 });
 
-// Speculative: バックグラウンドで先行翻訳してキャッシュに入れる
 async function speculativeTranslate(text, targetLang) {
-  if (!text || text.length > 500) return; // 短文のみ投機的に翻訳
+  if (!text || text.length > 500) return;
   const key = makeCacheKey(text, targetLang, 'selection');
-  if (memGet(key)) return; // 既にキャッシュにある
-  if (speculativeResults.has(key)) return; // 既にinflight
+  if (memGet(key)) return;
+  if (speculativeResults.has(key)) return;
 
-  // Evict old speculative entries
   if (speculativeResults.size >= SPECULATIVE_MAX) {
     const firstKey = speculativeResults.keys().next().value;
     speculativeResults.delete(firstKey);
@@ -326,25 +339,21 @@ async function speculativeTranslate(text, targetLang) {
   speculativeResults.set(key, Date.now());
 
   try {
-    // キャッシュチェック (IndexedDB)
     const cached = await getCached(text, targetLang, 'selection');
     if (cached) { speculativeResults.delete(key); return; }
 
-    // 先行翻訳リクエスト
     const settings = await getSettings();
     const model = selectModel(text, settings.model);
     const systemPrompt = buildSystemPrompt(targetLang, 'selection');
     const maxOutputTokens = calcMaxTokens(text, 'selection');
+    const genConfig = buildGenConfig(model, 0.1, maxOutputTokens);
 
     let data;
     if (authState.authenticated && settings.workerUrl) {
       const workerUrl = `${settings.workerUrl.replace(/\/+$/, '')}/api/translate`;
       const response = await fetch(workerUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${authState.token}`
-        },
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authState.token}` },
         body: JSON.stringify({ model, systemPrompt, contents: [{ parts: [{ text }] }], temperature: 0.1, maxOutputTokens })
       });
       if (!response.ok) { speculativeResults.delete(key); return; }
@@ -359,7 +368,8 @@ async function speculativeTranslate(text, targetLang) {
         body: JSON.stringify({
           system_instruction: { parts: [{ text: systemPrompt }] },
           contents: [{ parts: [{ text }] }],
-          generationConfig: { temperature: 0.1, maxOutputTokens }
+          generationConfig: genConfig,
+          safetySettings: SAFETY_OFF
         })
       });
       if (!response.ok) { speculativeResults.delete(key); return; }
@@ -401,7 +411,6 @@ chrome.runtime.onConnect.addListener((port) => {
 
   port.onMessage.addListener(async (request) => {
     try {
-      // Cache check (skip for reply)
       if (request.mode !== 'reply') {
         const cached = await getCached(request.text, request.targetLang, request.mode);
         if (cached) {
@@ -411,7 +420,6 @@ chrome.runtime.onConnect.addListener((port) => {
         }
       }
 
-      // Fetch settings + apiKey in parallel
       const [settings, apiKey] = await Promise.all([
         getSettings(),
         authState.authenticated ? Promise.resolve(null) : getApiKey()
@@ -426,6 +434,7 @@ chrome.runtime.onConnect.addListener((port) => {
       const model = selectModel(request.text, settings.model);
       const temperature = request.mode === 'reply' ? 0.4 : 0.1;
       const maxOutputTokens = calcMaxTokens(request.text, request.mode);
+      const genConfig = buildGenConfig(model, temperature, maxOutputTokens);
 
       let response;
 
@@ -433,11 +442,8 @@ chrome.runtime.onConnect.addListener((port) => {
         const workerUrl = `${settings.workerUrl.replace(/\/+$/, '')}/api/translate/stream`;
         response = await fetch(workerUrl, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${authState.token}`
-          },
-          body: JSON.stringify({ model, systemPrompt, contents, temperature, maxOutputTokens })
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authState.token}` },
+          body: JSON.stringify({ model, systemPrompt, contents, temperature, maxOutputTokens, genConfig })
         });
       } else {
         if (!apiKey) {
@@ -451,7 +457,8 @@ chrome.runtime.onConnect.addListener((port) => {
           body: JSON.stringify({
             system_instruction: { parts: [{ text: systemPrompt }] },
             contents,
-            generationConfig: { temperature, maxOutputTokens }
+            generationConfig: genConfig,
+            safetySettings: SAFETY_OFF
           })
         });
       }
@@ -468,7 +475,7 @@ chrome.runtime.onConnect.addListener((port) => {
         return;
       }
 
-      // Parse SSE stream — optimized line processing
+      // Parse SSE stream
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
@@ -513,7 +520,7 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 // =====================================================
-// Non-streaming call (page translation) with dedup
+// Non-streaming call with dedup
 // =====================================================
 async function callGemini(text, targetLang, mode) {
   const cacheKey = makeCacheKey(text, targetLang, mode);
@@ -538,6 +545,7 @@ async function _callGeminiImpl(text, targetLang, mode) {
   const model = selectModel(text, settings.model);
   const systemPrompt = buildSystemPrompt(targetLang, mode);
   const maxOutputTokens = calcMaxTokens(text, mode);
+  const genConfig = buildGenConfig(model, 0.1, maxOutputTokens);
 
   let data;
 
@@ -545,11 +553,8 @@ async function _callGeminiImpl(text, targetLang, mode) {
     const workerUrl = `${settings.workerUrl.replace(/\/+$/, '')}/api/translate`;
     const response = await fetch(workerUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${authState.token}`
-      },
-      body: JSON.stringify({ model, systemPrompt, contents: [{ parts: [{ text }] }], temperature: 0.1, maxOutputTokens })
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authState.token}` },
+      body: JSON.stringify({ model, systemPrompt, contents: [{ parts: [{ text }] }], temperature: 0.1, maxOutputTokens, genConfig })
     });
     if (!response.ok) throw new Error(`API Error (${response.status}): ${await response.text()}`);
     data = await response.json();
@@ -563,7 +568,8 @@ async function _callGeminiImpl(text, targetLang, mode) {
       body: JSON.stringify({
         system_instruction: { parts: [{ text: systemPrompt }] },
         contents: [{ parts: [{ text }] }],
-        generationConfig: { temperature: 0.1, maxOutputTokens }
+        generationConfig: genConfig,
+        safetySettings: SAFETY_OFF
       })
     });
     if (!response.ok) throw new Error(`API Error (${response.status}): ${await response.text()}`);
@@ -576,7 +582,7 @@ async function _callGeminiImpl(text, targetLang, mode) {
 }
 
 // =====================================================
-// Batch translation (parallel, for page translation)
+// Batch translation (parallel)
 // =====================================================
 async function callGeminiBatch(items, targetLang, mode) {
   const CONCURRENCY = 4;
@@ -586,24 +592,19 @@ async function callGeminiBatch(items, targetLang, mode) {
   async function worker() {
     while (idx < items.length) {
       const i = idx++;
-      try {
-        results[i] = await callGemini(items[i], targetLang, mode);
-      } catch (err) {
-        results[i] = { error: err.message };
-      }
+      try { results[i] = await callGemini(items[i], targetLang, mode); }
+      catch (err) { results[i] = { error: err.message }; }
     }
   }
 
   const workers = [];
-  for (let w = 0; w < Math.min(CONCURRENCY, items.length); w++) {
-    workers.push(worker());
-  }
+  for (let w = 0; w < Math.min(CONCURRENCY, items.length); w++) workers.push(worker());
   await Promise.all(workers);
   return results;
 }
 
 // =====================================================
-// Prompt builders (短縮版: 入力トークン削減 → TTFT短縮)
+// Prompt builders (ultra-short for TTFT)
 // =====================================================
 const LANG_NAMES = { ja:'日本語',en:'English',zh:'中文',ko:'한국어',es:'Español',fr:'Français',de:'Deutsch',pt:'Português',ru:'Русский',ar:'العربية',hi:'हिन्दी',it:'Italiano' };
 
@@ -636,45 +637,62 @@ function buildReplyContents(originalText, translatedText, replyHistory, userInte
 }
 
 // =====================================================
-// Storage & URL helpers (with aggressive caching)
+// Storage helpers (chrome.storage.session for speed)
 // =====================================================
 let settingsCache = null;
-let settingsCacheTime = 0;
-const SETTINGS_CACHE_TTL = 10000; // 10s
-
 let apiKeyCache = null;
-let apiKeyCacheTime = 0;
+
+// 起動時に chrome.storage.session にコピー（メモリ上 → ディスクI/Oなし）
+async function initSessionCache() {
+  try {
+    const data = await chrome.storage.sync.get(['geminiApiKey', 'settings']);
+    settingsCache = data.settings || {};
+    apiKeyCache = data.geminiApiKey || null;
+    // session storageにも保存（SW再起動時の高速復帰用）
+    await chrome.storage.session.set({ _settings: settingsCache, _apiKey: apiKeyCache });
+  } catch {
+    // session storage未対応の場合はsyncから直接読む
+    const data = await chrome.storage.sync.get(['geminiApiKey', 'settings']);
+    settingsCache = data.settings || {};
+    apiKeyCache = data.geminiApiKey || null;
+  }
+}
+
+initSessionCache();
 
 async function getApiKey() {
-  const now = Date.now();
-  if (apiKeyCache && (now - apiKeyCacheTime) < SETTINGS_CACHE_TTL) {
-    return apiKeyCache;
-  }
+  if (apiKeyCache) return apiKeyCache;
+  // SW再起動後: sessionから復帰（syncより高速）
+  try {
+    const s = await chrome.storage.session.get('_apiKey');
+    if (s._apiKey) { apiKeyCache = s._apiKey; return apiKeyCache; }
+  } catch {}
   const result = await chrome.storage.sync.get('geminiApiKey');
   apiKeyCache = result.geminiApiKey;
-  apiKeyCacheTime = now;
   return apiKeyCache;
 }
 
 async function getSettings() {
-  const now = Date.now();
-  if (settingsCache && (now - settingsCacheTime) < SETTINGS_CACHE_TTL) {
-    return settingsCache;
-  }
+  if (settingsCache) return settingsCache;
+  try {
+    const s = await chrome.storage.session.get('_settings');
+    if (s._settings) { settingsCache = s._settings; return settingsCache; }
+  } catch {}
   const result = await chrome.storage.sync.get('settings');
   settingsCache = result.settings || {};
-  settingsCacheTime = now;
   return settingsCache;
 }
 
-chrome.storage.onChanged.addListener((changes) => {
-  if (changes.settings) {
-    settingsCache = changes.settings.newValue || {};
-    settingsCacheTime = Date.now();
-  }
-  if (changes.geminiApiKey) {
-    apiKeyCache = changes.geminiApiKey.newValue;
-    apiKeyCacheTime = Date.now();
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'sync') {
+    if (changes.settings) {
+      settingsCache = changes.settings.newValue || {};
+      chrome.storage.session.set({ _settings: settingsCache }).catch(() => {});
+    }
+    if (changes.geminiApiKey) {
+      apiKeyCache = changes.geminiApiKey.newValue;
+      chrome.storage.session.set({ _apiKey: apiKeyCache }).catch(() => {});
+    }
   }
 });
 

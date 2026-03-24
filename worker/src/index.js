@@ -7,6 +7,14 @@
 const tokenCache = new Map();
 const TOKEN_CACHE_TTL = 5 * 60 * 1000; // 5分
 
+// Safety settings OFF: 翻訳はsafeタスク → フィルタオーバーヘッド削減
+const SAFETY_OFF = [
+  { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+];
+
 export default {
   async fetch(request, env) {
     // CORS preflight
@@ -80,7 +88,7 @@ async function handleTranslateStream(request, env) {
   }
 
   const body = await request.json();
-  const { model, systemPrompt, contents, temperature, maxOutputTokens } = body;
+  const { model, systemPrompt, contents, temperature, maxOutputTokens, genConfig } = body;
 
   const apiKey = env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -92,16 +100,20 @@ async function handleTranslateStream(request, env) {
 
   const geminiUrl = buildGeminiUrl(model, 'streamGenerateContent', apiKey, env.AI_GATEWAY_URL) + '&alt=sse';
 
+  // クライアントからgenConfig(thinkingBudget等)が来たらそのまま使う
+  const finalGenConfig = genConfig || {
+    temperature: temperature ?? 0.1,
+    maxOutputTokens: maxOutputTokens ?? 8192
+  };
+
   const geminiResponse = await fetch(geminiUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       system_instruction: { parts: [{ text: systemPrompt }] },
       contents,
-      generationConfig: {
-        temperature: temperature ?? 0.1,
-        maxOutputTokens: maxOutputTokens ?? 8192
-      }
+      generationConfig: finalGenConfig,
+      safetySettings: SAFETY_OFF
     })
   });
 
@@ -136,7 +148,7 @@ async function handleTranslate(request, env) {
   }
 
   const body = await request.json();
-  const { model, systemPrompt, contents, temperature, maxOutputTokens } = body;
+  const { model, systemPrompt, contents, temperature, maxOutputTokens, genConfig } = body;
 
   const apiKey = env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -148,16 +160,19 @@ async function handleTranslate(request, env) {
 
   const geminiUrl = buildGeminiUrl(model, 'generateContent', apiKey, env.AI_GATEWAY_URL);
 
+  const finalGenConfig = genConfig || {
+    temperature: temperature ?? 0.1,
+    maxOutputTokens: maxOutputTokens ?? 8192
+  };
+
   const geminiResponse = await fetch(geminiUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       system_instruction: { parts: [{ text: systemPrompt }] },
       contents,
-      generationConfig: {
-        temperature: temperature ?? 0.1,
-        maxOutputTokens: maxOutputTokens ?? 8192
-      }
+      generationConfig: finalGenConfig,
+      safetySettings: SAFETY_OFF
     })
   });
 

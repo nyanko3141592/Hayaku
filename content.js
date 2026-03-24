@@ -164,20 +164,37 @@
       timerEl.textContent = `${((performance.now() - startTime) / 1000).toFixed(1)}s`;
     }, 100);
 
+    // rAFバッチDOM更新: チャンクを蓄積し、フレーム単位でまとめて描画
+    // → リフロー回数を最小化、高頻度チャンクでもスムーズ
+    let pendingChunks = '';
+    let rafScheduled = false;
+
+    function flushChunks() {
+      rafScheduled = false;
+      if (!pendingChunks) return;
+      if (!firstChunkReceived) {
+        firstChunkReceived = true;
+        contentEl.textContent = '';
+      }
+      translatedText += pendingChunks;
+      contentEl.textContent = translatedText;
+      pendingChunks = '';
+      adjustTooltipPosition(tooltip);
+    }
+
     port.onMessage.addListener((msg) => {
       if (msg.type === 'chunk') {
-        if (!firstChunkReceived) {
-          firstChunkReceived = true;
-          contentEl.textContent = ''; // スケルトンをクリア
+        pendingChunks += msg.text;
+        if (!rafScheduled) {
+          rafScheduled = true;
+          requestAnimationFrame(flushChunks);
         }
-        translatedText += msg.text;
-        contentEl.textContent = translatedText;
-        adjustTooltipPosition(tooltip);
       }
       if (msg.type === 'done') {
+        // 残りのチャンクをフラッシュ
+        if (pendingChunks) flushChunks();
         clearInterval(timerInterval);
         const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
-        // キャッシュヒット時は "cached" を表示
         timerEl.textContent = msg.cached ? 'cached' : `${elapsed}s`;
         tooltip.querySelector('.hyk-loading').style.display = 'none';
         addCopyButton(tooltip, translatedText);
