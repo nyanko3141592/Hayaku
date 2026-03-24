@@ -200,11 +200,8 @@ async function setCache(text, targetLang, mode, translation) {
 // Smart Model Selection
 // =====================================================
 function selectModel(text, userModel) {
-  if (userModel && (userModel.includes('pro') || userModel.includes('3-flash'))) return userModel;
-  const len = text.length;
-  if (len <= 200) return 'gemini-3.1-flash-lite-preview';
-  if (len <= 2000) return userModel || 'gemini-3.1-flash-lite-preview';
-  return userModel || 'gemini-2.5-flash';
+  if (userModel && userModel !== 'gemini-3.1-flash-lite-preview') return userModel;
+  return 'gemini-3.1-flash-lite-preview';
 }
 
 // =====================================================
