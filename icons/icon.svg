@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f0f1a"/>
+      <stop offset="100%" style="stop-color:#1a1a2e"/>
+    </linearGradient>
+    <linearGradient id="text" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#00d4ff"/>
+      <stop offset="100%" style="stop-color:#7b2ff7"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="30%" cy="30%" r="70%">
+      <stop offset="0%" style="stop-color:rgba(0,212,255,0.15)"/>
+      <stop offset="100%" style="stop-color:rgba(120,0,255,0.05)"/>
+    </radialGradient>
+  </defs>
+  <rect x="2" y="2" width="124" height="124" rx="22" fill="url(#bg)" stroke="rgba(0,212,255,0.3)" stroke-width="2"/>
+  <rect x="2" y="2" width="124" height="124" rx="22" fill="url(#glow)"/>
+  <text x="64" y="74" text-anchor="middle" font-family="-apple-system, Hiragino Sans, sans-serif" font-size="66" font-weight="bold" fill="url(#text)">翻</text>
+</svg>

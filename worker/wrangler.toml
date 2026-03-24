@@ -1,0 +1,12 @@
+name = "hayaku-translate"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+[vars]
+# 許可するGoogleドメイン（カンマ区切りで複数可、空なら全ドメイン許可）
+ALLOWED_DOMAINS = ""
+# Cloudflare AI Gateway URL（任意）
+AI_GATEWAY_URL = ""
+
+# シークレットは `wrangler secret put` で設定
+# GEMINI_API_KEY = "..."
