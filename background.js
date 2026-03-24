@@ -1,19 +1,17 @@
 // Hayaku Translate - Background Service Worker
 // デュアルモード: Google認証 (Worker経由) / APIキー直接
-// 高速化: インメモリL1キャッシュ + 並列バッチ翻訳 + adaptive maxOutputTokens
+// 高速化v2: preflight OPTIONS事前キャッシュ + 短縮プロンプト + speculative翻訳
 
 // =====================================================
 // Auth State
 // =====================================================
 let authState = { authenticated: false, token: null, user: null };
 
-// 起動時にサイレント認証を試みる
 trysilentAuth();
 
 async function trysilentAuth() {
   const settings = await getSettings();
   if (!settings.workerUrl) return;
-
   try {
     const token = await getGoogleToken(false);
     if (token) {
@@ -23,19 +21,14 @@ async function trysilentAuth() {
         broadcastAuthState();
       }
     }
-  } catch {
-    // サイレント認証失敗は無視
-  }
+  } catch {}
 }
 
 function getGoogleToken(interactive) {
   return new Promise((resolve, reject) => {
     chrome.identity.getAuthToken({ interactive }, (token) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-      } else {
-        resolve(token);
-      }
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve(token);
     });
   });
 }
@@ -62,28 +55,44 @@ function broadcastAuthState() {
 }
 
 // =====================================================
-// Preflight Warmup (aggressive: 10min interval)
+// Aggressive Preflight Warmup
+// nani-translate方式: OPTIONSプリフライト事前キャッシュ
+// + 実際のストリーミングエンドポイントでTLS/TCP warm
 // =====================================================
-const WARMUP_INTERVAL_MS = 10 * 60 * 1000;
+const WARMUP_INTERVAL_MS = 5 * 60 * 1000; // 5分（より攻撃的）
 
 async function warmupConnection() {
-  if (authState.authenticated) {
-    const settings = await getSettings();
-    if (settings.workerUrl) {
-      try { await fetch(`${settings.workerUrl.replace(/\/+$/, '')}/api/auth/verify`, {
+  const settings = await getSettings();
+
+  if (authState.authenticated && settings.workerUrl) {
+    const base = settings.workerUrl.replace(/\/+$/, '');
+    // Worker: auth verify + OPTIONSプリフライト事前送信
+    await Promise.allSettled([
+      fetch(`${base}/api/auth/verify`, {
         headers: { 'Authorization': `Bearer ${authState.token}` }
-      }); } catch {}
-    }
+      }),
+      // ストリーミングエンドポイントへのOPTIONS事前送信
+      fetch(`${base}/api/translate/stream`, { method: 'OPTIONS' }),
+      fetch(`${base}/api/translate`, { method: 'OPTIONS' }),
+    ]);
   } else {
     const apiKey = await getApiKey();
     if (!apiKey) return;
-    const settings = await getSettings();
+    // 直接モード: 実際のストリーミングエンドポイントでwarm
+    // countTokensではなくstreamGenerateContentでTLS+DNS+TCPをwarm
+    const model = 'gemini-3.1-flash-lite-preview';
+    const gwUrl = settings.gatewayUrl;
+    const streamUrl = buildApiUrl(model, 'streamGenerateContent', apiKey, gwUrl) + '&alt=sse';
+    const nonStreamUrl = buildApiUrl(model, 'generateContent', apiKey, gwUrl);
     try {
-      const url = buildApiUrl('gemini-3.1-flash-lite-preview', 'countTokens', apiKey, settings.gatewayUrl);
-      await fetch(url, {
+      // 極小リクエストで接続をwarm（空翻訳）
+      await fetch(streamUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: 'w' }] }] })
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: '.' }] }],
+          generationConfig: { temperature: 0, maxOutputTokens: 1 }
+        })
       });
     } catch {}
   }
@@ -101,7 +110,6 @@ const MEM_CACHE_MAX = 200;
 function memGet(key) {
   const entry = memCache.get(key);
   if (!entry) return null;
-  // LRU: move to end
   memCache.delete(key);
   memCache.set(key, entry);
   return entry;
@@ -109,7 +117,6 @@ function memGet(key) {
 
 function memSet(key, value) {
   if (memCache.size >= MEM_CACHE_MAX) {
-    // Evict oldest (first entry)
     const firstKey = memCache.keys().next().value;
     memCache.delete(firstKey);
   }
@@ -154,12 +161,8 @@ function makeCacheKey(text, targetLang, mode) {
 
 async function getCached(text, targetLang, mode) {
   const key = makeCacheKey(text, targetLang, mode);
-
-  // L1: in-memory (instant)
   const mem = memGet(key);
   if (mem) return mem;
-
-  // L2: IndexedDB
   try {
     const db = await openCacheDB();
     return new Promise((resolve) => {
@@ -169,7 +172,6 @@ async function getCached(text, targetLang, mode) {
       req.onsuccess = () => {
         const entry = req.result;
         if (entry && (Date.now() - entry.timestamp) < CACHE_MAX_AGE_MS) {
-          // Promote to L1
           memSet(key, entry.translation);
           resolve(entry.translation);
         } else {
@@ -183,11 +185,7 @@ async function getCached(text, targetLang, mode) {
 
 async function setCache(text, targetLang, mode, translation) {
   const key = makeCacheKey(text, targetLang, mode);
-
-  // L1: immediate
   memSet(key, translation);
-
-  // L2: IndexedDB (fire-and-forget)
   try {
     const db = await openCacheDB();
     const tx = db.transaction(CACHE_STORE, 'readwrite');
@@ -221,15 +219,15 @@ function selectModel(text, userModel) {
 }
 
 // =====================================================
-// Adaptive maxOutputTokens (reduce overhead for short text)
+// Adaptive maxOutputTokens
 // =====================================================
 function calcMaxTokens(text, mode) {
   if (mode === 'reply') return 4096;
   const len = text.length;
-  // Translation output ≈ same length as input (with margin)
-  if (len <= 100) return 512;
-  if (len <= 500) return 1024;
-  if (len <= 2000) return 2048;
+  if (len <= 100) return 256;   // さらに絞る: 短文は256で十分
+  if (len <= 300) return 512;
+  if (len <= 1000) return 1024;
+  if (len <= 3000) return 2048;
   if (len <= 5000) return 4096;
   return 8192;
 }
@@ -238,6 +236,14 @@ function calcMaxTokens(text, mode) {
 // Request deduplication
 // =====================================================
 const inflightRequests = new Map();
+
+// =====================================================
+// Speculative pre-translation
+// テキスト選択時点でバックグラウンドに通知 → キャッシュに先行投入
+// =====================================================
+const speculativeResults = new Map();
+const SPECULATIVE_MAX = 10;
+const SPECULATIVE_TTL = 60000; // 1min
 
 // =====================================================
 // Context menu & shortcuts
@@ -278,6 +284,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  // Speculative pre-translation: content scriptがテキスト選択時に送信
+  if (request.action === 'speculative-translate') {
+    speculativeTranslate(request.text, request.targetLang);
+    return false;
+  }
+
   if (request.action === 'get-auth-state') {
     sendResponse({
       authenticated: authState.authenticated,
@@ -299,28 +311,83 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 });
 
+// Speculative: バックグラウンドで先行翻訳してキャッシュに入れる
+async function speculativeTranslate(text, targetLang) {
+  if (!text || text.length > 500) return; // 短文のみ投機的に翻訳
+  const key = makeCacheKey(text, targetLang, 'selection');
+  if (memGet(key)) return; // 既にキャッシュにある
+  if (speculativeResults.has(key)) return; // 既にinflight
+
+  // Evict old speculative entries
+  if (speculativeResults.size >= SPECULATIVE_MAX) {
+    const firstKey = speculativeResults.keys().next().value;
+    speculativeResults.delete(firstKey);
+  }
+  speculativeResults.set(key, Date.now());
+
+  try {
+    // キャッシュチェック (IndexedDB)
+    const cached = await getCached(text, targetLang, 'selection');
+    if (cached) { speculativeResults.delete(key); return; }
+
+    // 先行翻訳リクエスト
+    const settings = await getSettings();
+    const model = selectModel(text, settings.model);
+    const systemPrompt = buildSystemPrompt(targetLang, 'selection');
+    const maxOutputTokens = calcMaxTokens(text, 'selection');
+
+    let data;
+    if (authState.authenticated && settings.workerUrl) {
+      const workerUrl = `${settings.workerUrl.replace(/\/+$/, '')}/api/translate`;
+      const response = await fetch(workerUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${authState.token}`
+        },
+        body: JSON.stringify({ model, systemPrompt, contents: [{ parts: [{ text }] }], temperature: 0.1, maxOutputTokens })
+      });
+      if (!response.ok) { speculativeResults.delete(key); return; }
+      data = await response.json();
+    } else {
+      const apiKey = await getApiKey();
+      if (!apiKey) { speculativeResults.delete(key); return; }
+      const url = buildApiUrl(model, 'generateContent', apiKey, settings.gatewayUrl);
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: systemPrompt }] },
+          contents: [{ parts: [{ text }] }],
+          generationConfig: { temperature: 0.1, maxOutputTokens }
+        })
+      });
+      if (!response.ok) { speculativeResults.delete(key); return; }
+      data = await response.json();
+    }
+
+    const result = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    if (result) setCache(text, targetLang, 'selection', result);
+  } catch {}
+  speculativeResults.delete(key);
+}
+
 async function handleGoogleLogin() {
   const settings = await getSettings();
-  if (!settings.workerUrl) {
-    return { error: 'Worker URLが設定されていません' };
-  }
-
+  if (!settings.workerUrl) return { error: 'Worker URLが設定されていません' };
   const token = await getGoogleToken(true);
   const user = await verifyWithWorker(token, settings.workerUrl);
   if (!user) {
     chrome.identity.removeCachedAuthToken({ token });
     return { error: '認証に失敗しました。許可されたドメインのアカウントでログインしてください。' };
   }
-
   authState = { authenticated: true, token, user };
   broadcastAuthState();
   return { authenticated: true, email: user.email, name: user.name, picture: user.picture };
 }
 
 async function handleGoogleLogout() {
-  if (authState.token) {
-    chrome.identity.removeCachedAuthToken({ token: authState.token });
-  }
+  if (authState.token) chrome.identity.removeCachedAuthToken({ token: authState.token });
   authState = { authenticated: false, token: null, user: null };
   broadcastAuthState();
   return { authenticated: false };
@@ -401,7 +468,7 @@ chrome.runtime.onConnect.addListener((port) => {
         return;
       }
 
-      // Parse SSE stream (optimized: avoid repeated string concat for buffer)
+      // Parse SSE stream — optimized line processing
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
@@ -413,13 +480,12 @@ chrome.runtime.onConnect.addListener((port) => {
 
         buffer += decoder.decode(value, { stream: true });
 
-        // Fast path: process all complete lines
         let newlineIdx;
         while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
           const line = buffer.slice(0, newlineIdx);
           buffer = buffer.slice(newlineIdx + 1);
 
-          if (line.length < 7 || line.charCodeAt(0) !== 100) continue; // 'd' = 100
+          if (line.length < 7 || line.charCodeAt(0) !== 100) continue;
           if (!line.startsWith('data: ')) continue;
           const jsonStr = line.slice(6);
           if (!jsonStr || jsonStr === '[DONE]') continue;
@@ -454,7 +520,6 @@ async function callGemini(text, targetLang, mode) {
   const cached = await getCached(text, targetLang, mode);
   if (cached) return cached;
 
-  // Dedup: if same request in-flight, await it
   if (inflightRequests.has(cacheKey)) {
     return inflightRequests.get(cacheKey);
   }
@@ -462,8 +527,7 @@ async function callGemini(text, targetLang, mode) {
   const promise = _callGeminiImpl(text, targetLang, mode);
   inflightRequests.set(cacheKey, promise);
   try {
-    const result = await promise;
-    return result;
+    return await promise;
   } finally {
     inflightRequests.delete(cacheKey);
   }
@@ -485,18 +549,9 @@ async function _callGeminiImpl(text, targetLang, mode) {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${authState.token}`
       },
-      body: JSON.stringify({
-        model,
-        systemPrompt,
-        contents: [{ parts: [{ text }] }],
-        temperature: 0.1,
-        maxOutputTokens
-      })
+      body: JSON.stringify({ model, systemPrompt, contents: [{ parts: [{ text }] }], temperature: 0.1, maxOutputTokens })
     });
-    if (!response.ok) {
-      const errBody = await response.text();
-      throw new Error(`API Error (${response.status}): ${errBody}`);
-    }
+    if (!response.ok) throw new Error(`API Error (${response.status}): ${await response.text()}`);
     data = await response.json();
   } else {
     const apiKey = await getApiKey();
@@ -511,10 +566,7 @@ async function _callGeminiImpl(text, targetLang, mode) {
         generationConfig: { temperature: 0.1, maxOutputTokens }
       })
     });
-    if (!response.ok) {
-      const errBody = await response.text();
-      throw new Error(`API Error (${response.status}): ${errBody}`);
-    }
+    if (!response.ok) throw new Error(`API Error (${response.status}): ${await response.text()}`);
     data = await response.json();
   }
 
@@ -551,27 +603,27 @@ async function callGeminiBatch(items, targetLang, mode) {
 }
 
 // =====================================================
-// Prompt builders
+// Prompt builders (短縮版: 入力トークン削減 → TTFT短縮)
 // =====================================================
 const LANG_NAMES = { ja:'日本語',en:'English',zh:'中文',ko:'한국어',es:'Español',fr:'Français',de:'Deutsch',pt:'Português',ru:'Русский',ar:'العربية',hi:'हिन्दी',it:'Italiano' };
 
 function buildSystemPrompt(targetLang, mode) {
-  const langName = LANG_NAMES[targetLang] || targetLang;
+  const lang = LANG_NAMES[targetLang] || targetLang;
   if (mode === 'page') {
-    return `You are a professional translator. Translate the given HTML text content to ${langName}.\nRules:\n- Translate ONLY the text content, preserve all HTML tags and attributes\n- Keep code snippets, URLs, proper nouns as-is\n- Output ONLY the translated text, no explanations\n- Maintain the original formatting and structure\n- Be natural and fluent, not literal`;
+    return `Translate to ${lang}. Preserve HTML tags/attributes. Keep code/URLs/proper nouns. Output only translated text. Be natural, not literal.`;
   }
-  return `You are a professional translator. Translate the given text to ${langName}.\nRules:\n- Output ONLY the translated text, no explanations or preamble\n- Keep code snippets, URLs, proper nouns as-is\n- Be natural and fluent, not word-by-word literal\n- Match the tone and register of the original`;
+  return `Translate to ${lang}. Output only the translation. Keep code/URLs/proper nouns. Be natural, not literal. Match original tone.`;
 }
 
 function buildReplyPrompt(replyLang) {
-  const langName = LANG_NAMES[replyLang] || replyLang;
-  return `You are a professional reply composer.\n\nScenario: The user received a message in ${langName}. They understand its meaning via a translation. Now they want to write a reply. The user will describe what they want to say — often in a DIFFERENT language (e.g. Japanese). Your job is to turn their intent into a polished reply written in ${langName}.\n\nYou will be given:\n1. The original message the user received (in ${langName})\n2. Its translation (so the user could understand it)\n3. Optionally, previous reply drafts and refinements\n4. The user's new reply intent (in their own language)\n\nRules:\n- ALWAYS write the reply in ${langName} — this is critical, never reply in the user's input language\n- Match the tone, formality, and register of the original message\n- The reply should read as if written by a native ${langName} speaker\n- Output ONLY the reply text — no labels, explanations, or preamble\n- Keep it concise unless the user's intent suggests a longer reply\n- If the user asks for adjustments, refine the previous reply accordingly`;
+  const lang = LANG_NAMES[replyLang] || replyLang;
+  return `You compose replies in ${lang}. The user received a message in ${lang} and wants to reply. Turn their intent into a polished ${lang} reply. ALWAYS write in ${lang}. Match tone/formality of original. Output ONLY the reply text.`;
 }
 
 function buildReplyContents(originalText, translatedText, replyHistory, userIntent) {
   const contents = [
-    { role: 'user', parts: [{ text: `[Original message received]\n${originalText}\n\n[Translation for reference]\n${translatedText}` }] },
-    { role: 'model', parts: [{ text: 'I understand the message. What would you like to reply?' }] }
+    { role: 'user', parts: [{ text: `[Original]\n${originalText}\n\n[Translation]\n${translatedText}` }] },
+    { role: 'model', parts: [{ text: 'Ready. What should I reply?' }] }
   ];
   if (replyHistory?.length > 0) {
     for (const turn of replyHistory) {
@@ -584,15 +636,24 @@ function buildReplyContents(originalText, translatedText, replyHistory, userInte
 }
 
 // =====================================================
-// Storage & URL helpers (with settings cache)
+// Storage & URL helpers (with aggressive caching)
 // =====================================================
 let settingsCache = null;
 let settingsCacheTime = 0;
-const SETTINGS_CACHE_TTL = 5000; // 5s
+const SETTINGS_CACHE_TTL = 10000; // 10s
+
+let apiKeyCache = null;
+let apiKeyCacheTime = 0;
 
 async function getApiKey() {
+  const now = Date.now();
+  if (apiKeyCache && (now - apiKeyCacheTime) < SETTINGS_CACHE_TTL) {
+    return apiKeyCache;
+  }
   const result = await chrome.storage.sync.get('geminiApiKey');
-  return result.geminiApiKey;
+  apiKeyCache = result.geminiApiKey;
+  apiKeyCacheTime = now;
+  return apiKeyCache;
 }
 
 async function getSettings() {
@@ -606,11 +667,14 @@ async function getSettings() {
   return settingsCache;
 }
 
-// Invalidate settings cache when changed
 chrome.storage.onChanged.addListener((changes) => {
   if (changes.settings) {
     settingsCache = changes.settings.newValue || {};
     settingsCacheTime = Date.now();
+  }
+  if (changes.geminiApiKey) {
+    apiKeyCache = changes.geminiApiKey.newValue;
+    apiKeyCacheTime = Date.now();
   }
 });
 

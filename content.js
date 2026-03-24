@@ -1,10 +1,23 @@
 // Hayaku Translator - Content Script
+// 高速化v2: speculative pre-translation + DNS preconnect
 
 (() => {
   let tooltip = null;
   let currentStream = null;
   let isPageTranslated = false;
   let originalTexts = new Map();
+
+  // DNS Preconnect: Gemini APIドメインへのTLS/TCPを事前確立
+  (() => {
+    const domains = ['generativelanguage.googleapis.com', 'gateway.ai.cloudflare.com'];
+    for (const domain of domains) {
+      const link = document.createElement('link');
+      link.rel = 'preconnect';
+      link.href = `https://${domain}`;
+      link.crossOrigin = 'anonymous';
+      document.head.appendChild(link);
+    }
+  })();
 
   // Settings cache
   let cachedSettings = { targetLang: 'ja', model: 'gemini-3.1-flash-lite-preview' };
@@ -35,14 +48,31 @@
     }
   });
 
+  // Speculative pre-translation: テキスト選択時にバックグラウンドへ先行送信
+  let lastSpeculativeText = '';
+  let speculativeDebounce = null;
+
   // Show tooltip on text selection + keyboard shortcut or button
   document.addEventListener('mouseup', (e) => {
-    // Ignore clicks inside our tooltip
     if (e.target.closest('.hyk-tooltip')) return;
 
     const text = window.getSelection().toString().trim();
     if (text && text.length > 1 && text.length < 10000) {
       showMiniButton(e.clientX, e.clientY, text);
+
+      // Speculative: 選択した瞬間にバックグラウンドで先行翻訳開始
+      // ボタンを押す前にキャッシュに入る → ボタン押下時は即座にcachedで返る
+      if (text.length <= 500 && text !== lastSpeculativeText) {
+        lastSpeculativeText = text;
+        clearTimeout(speculativeDebounce);
+        speculativeDebounce = setTimeout(() => {
+          chrome.runtime.sendMessage({
+            action: 'speculative-translate',
+            text,
+            targetLang: detectTargetLang(text)
+          });
+        }, 150); // 150msデバウンス: 素早い再選択をフィルタ
+      }
     }
   });
 

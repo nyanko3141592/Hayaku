@@ -16,23 +16,46 @@ Gemini API搭載の爆速翻訳 Chrome拡張。速度にこだわり、コスト
 
 ## 高速化アーキテクチャ
 
+[nani-translate](https://zenn.dev/catnose99/articles/nani-translate) を参考に、コストより速度を徹底的に追求。
+
 ```
-テキスト選択 → リクエスト即時発火（UI構築と並行）
-                  ↓
-            L1 メモリキャッシュ (Map, LRU, ~0ms)
-                  ↓ miss
-            L2 IndexedDB キャッシュ (7日/500件)
-                  ↓ miss
-            スマートモデル選択 (短文→flash-lite, 長文→flash)
-                  ↓
-            Adaptive maxOutputTokens (短文は512, 長文は8192)
-                  ↓
-            SSE ストリーミング → スケルトン → 逐次表示
-                  ↓
-            プリフライト ウォームアップ (10分間隔)
-            リクエスト デデュプリケーション
-            設定キャッシュ (5秒TTL)
+テキスト選択
+  ├→ DNS preconnect (Gemini API ドメインへのTLS事前確立)
+  ├→ Speculative pre-translation (選択時点で先行翻訳開始)
+  └→ ミニボタン表示
+        ↓ クリック
+  リクエスト即時発火（UI構築と並行）
+        ↓
+  L1 メモリキャッシュ (Map, LRU, ~0ms) ← speculative結果がここに
+        ↓ miss
+  L2 IndexedDB キャッシュ (7日/500件)
+        ↓ miss
+  スマートモデル選択 (短文→flash-lite, 長文→flash)
+        ↓
+  短縮システムプロンプト (入力トークン削減 → TTFT短縮)
+        ↓
+  Adaptive maxOutputTokens (短文256, 中文1024, 長文8192)
+        ↓
+  SSE ストリーミング → スケルトン → 逐次表示
+        ↓
+  プリフライト OPTIONSキャッシュ (5分間隔, nani方式)
+  リクエスト デデュプリケーション
+  設定 + APIキー キャッシュ (10秒TTL)
 ```
+
+### 速度テクニック一覧
+
+| テクニック | 効果 | 参考 |
+|-----------|------|------|
+| **Speculative pre-translation** | テキスト選択→ボタン押下の間に翻訳完了。体感0ms | nani-translate |
+| **DNS preconnect** | TLS/TCPハンドシェイクを事前完了。初回TTFT -200ms | Web標準 |
+| **OPTIONS preflight cache** | CORSプリフライトを5分毎に事前送信。TTFT -100ms | nani-translate |
+| **短縮システムプロンプト** | 入力トークン50%削減。TTFT短縮 | - |
+| **L1 インメモリLRU** | キャッシュヒット ~0ms（IndexedDBスキップ） | - |
+| **Adaptive maxOutputTokens** | 短文は256トークン。APIオーバーヘッド削減 | - |
+| **4並列ページ翻訳** | 逐次→4ワーカー並列。約4倍速 | - |
+| **リクエストデデュプリケーション** | 同一テキストの重複API呼び出し排除 | - |
+| **ストリーミングwarmup** | countTokensではなく実際のエンドポイントでwarm | nani-translate |
 
 ## セットアップ
 
